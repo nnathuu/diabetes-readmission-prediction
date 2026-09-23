@@ -1,6 +1,6 @@
 """
-Ham xu ly du lieu cho du an du doan tai nhap vien <30 ngay
-(Diabetes 130-US hospitals dataset). Dung trong notebooks/01_data_eda.ipynb.
+Data preprocessing functions for the <30-day hospital readmission prediction project
+(Diabetes 130-US hospitals dataset). Used in notebooks/01_data_eda.ipynb.
 
 """
 
@@ -8,7 +8,7 @@ import pandas as pd
 import numpy as np
 from sklearn.model_selection import GroupShuffleSplit
 
-# ---- 1. Load du lieu goc ----
+# ---- 1. Load data ----
 def load_raw_data(input_dir="data/input"):
     df = pd.read_csv(f"{input_dir}/diabetic_data.csv")
     ids_mapping = pd.read_csv(f"{input_dir}/IDS_mapping.csv")
@@ -16,44 +16,75 @@ def load_raw_data(input_dir="data/input"):
 
 
 # ---- 2. Cleaning RULE-BASED
-EXPIRED_HOSPICE_IDS = [11, 13, 14, 19, 20, 21]  # tu IDS_mapping.csv (Expired / Hospice)
+EXPIRED_HOSPICE_IDS = [11, 13, 14, 19, 20, 21]  # from IDS_mapping.csv (Expired / Hospice)
 
 def basic_clean(df):
-    """Thay '?' bang NaN va loai cac dong benh nhan da mat / chuyen hospice.
-    Day la 2 buoc chi dua tren gia tri co dinh (khong phai thong ke hoc tu
-    toan bo du lieu), nen ap dung truoc khi split khong gay leakage.
+    """
+    Replace '?' with NaN and remove records of patients who expired or were transferred to hospice.
+    These two steps are based only on fixed values rather than statistics learned from
+    the entire dataset, so they can be safely applied before the train-test split
+    without causing data leakage
     """
     df = df.copy()
     df = df.replace("?", np.nan)
     n_before = df.shape[0]
     df = df[~df["discharge_disposition_id"].isin(EXPIRED_HOSPICE_IDS)]
-    print(f"[basic_clean] Da loai {n_before - df.shape[0]} dong (expired/hospice). "
-          f"Con lai {df.shape[0]} dong.")
+    print(f"[basic_clean] Removed {n_before - df.shape[0]} rows (expired/hospice). "
+          f"{df.shape[0]} rows remaining.")
     return df
 
 
-# ---- 3. Cac buoc PHAI fit tren train, roi ap dung lai cho test ----
+# ---- 3. Steps that MUST be fitted on train, then applied to test ----
 NEAR_CONSTANT_CANDIDATES = [
     "examide", "citoglipton", "acetohexamide", "troglitazone",
     "glimepiride-pioglitazone", "metformin-rosiglitazone", "metformin-pioglitazone",
 ]
 
 def fit_near_constant_cols(train_df, candidates=NEAR_CONSTANT_CANDIDATES, threshold=0.99):
-    """Chi nhin vao TRAIN de quyet dinh cot nao gan nhu hang so (>= threshold
-    cung 1 gia tri) va nen bi drop. Tranh viec quyet dinh nay bi anh huong
-    boi phan phoi cua tap test."""
+    """Inspect only the TRAIN set to determine which columns are nearly constant
+    (>= threshold having the same value) and should be dropped. This prevents
+    the decision from being influenced by the distribution of the test set"""
     dropped_cols = []
     for col in candidates:
         if col in train_df.columns:
             top_freq = train_df[col].value_counts(normalize=True, dropna=False).iloc[0]
             if top_freq >= threshold:
                 dropped_cols.append(col)
-    print(f"[fit_near_constant_cols] Cot se drop (fit tren train): {dropped_cols}")
+    print(f"[fit_near_constant_cols] Columns to drop (fitted on train): {dropped_cols}")
     return dropped_cols
 
 
 def drop_cols(df, cols):
     return df.drop(columns=[c for c in cols if c in df.columns])
+
+
+OUTLIER_COLS = ["num_medications", "num_lab_procedures", "number_diagnoses"]
+
+def fit_outlier_caps(train_df, cols=OUTLIER_COLS, factor=1.5):
+    """Calculate capping thresholds using the IQR method ONLY on the train set
+    to prevent the test set from influencing the thresholds"""
+    caps = {}
+    for col in cols:
+        if col in train_df.columns:
+            q1, q3 = train_df[col].quantile([0.25, 0.75])
+            iqr = q3 - q1
+            lower = max(train_df[col].min(), q1 - factor * iqr)
+            upper = q3 + factor * iqr
+            caps[col] = (lower, upper)
+    print(f"[fit_outlier_caps] Capping thresholds (fitted on train): {caps}")
+    return caps
+
+
+def apply_outlier_caps(df, caps):
+    df = df.copy()
+    for col, (lower, upper) in caps.items():
+        if col in df.columns:
+            n_capped = ((df[col] < lower) | (df[col] > upper)).sum()
+            if n_capped > 0:
+                print(f"[apply_outlier_caps] {col}: capped {n_capped} rows "
+                      f"outside [{lower:.1f}, {upper:.1f}]")
+            df[col] = df[col].clip(lower=lower, upper=upper)
+    return df
 
 
 CATEGORICAL_COLS = [
@@ -63,10 +94,10 @@ CATEGORICAL_COLS = [
 ]
 
 def fit_categories(train_df, cols=CATEGORICAL_COLS):
-    """Ghi lai tap gia tri (categories) cua tung cot categorical, CHI dua
-    tren train. Dung de ep test theo dung tap category cua train, tranh
-    truong hop dtype 'category' duoc suy ra tu ca test (vo tinh 'nhin thay'
-    test truoc khi train)."""
+    """Record the set of category values for each categorical column using ONLY
+    the train set. This ensures that the test set uses the same category set as
+    the train set and prevents the category dtype from being inferred from the
+    test set"""
     categories = {}
     for col in cols:
         if col in train_df.columns:
@@ -75,9 +106,10 @@ def fit_categories(train_df, cols=CATEGORICAL_COLS):
 
 
 def apply_categories(df, categories, unseen_label="Other_unseen"):
-    """Ap tap category cua train len df (train hoac test). Gia tri o test
-    ma train CHUA TUNG THAY se duoc gop vao nhan 'unseen_label' thay vi
-    bi bien thanh NaN, giu du lieu khong bi mat mot cach am tham."""
+    """Apply the category set learned from the train set to a dataframe
+    (train or test). Values in the test set that were never observed in the
+    train set are grouped under 'unseen_label' instead of being converted
+    to NaN, preventing silent data loss"""
     df = df.copy()
     for col, cats in categories.items():
         if col in df.columns:
@@ -88,12 +120,12 @@ def apply_categories(df, categories, unseen_label="Other_unseen"):
     return df
 
 
-# ---- 4. Missing values: dien gia tri CO DINH (khong hoc tu du lieu) ----
+# ---- 4. Missing values: fill with fixed values (not learned from the data) ----
 def handle_missing_values(df):
-    """Tat ca gia tri dien vao deu la hang so co dinh ('Unknown', 'Not tested'),
-    khong phai thong ke tinh tu du lieu (vd mean/median/mode), nen ham nay
-    an toan de goi truoc hoac sau khi split deu duoc, tren train hay test
-    deu cho ket qua nhat quan."""
+    """All replacement values are fixed labels ('Unknown', 'Not tested')
+    rather than statistics calculated from the data (e.g., mean, median, or mode).
+    Therefore, this function can safely be applied before or after the split,
+    and produces consistent results on both train and test sets"""
     df = df.copy()
     if "weight" in df.columns:
         df = df.drop(columns=["weight"])
@@ -109,7 +141,7 @@ def handle_missing_values(df):
     remaining_na = df.isna().sum()
     remaining_na = remaining_na[remaining_na > 0]
     if len(remaining_na):
-        print(f"[handle_missing_values] Cac cot con NaN sau xu ly:\n{remaining_na}")
+        print(f"[handle_missing_values] Columns with remaining NaN values:\n{remaining_na}")
     return df
 
 
@@ -120,7 +152,7 @@ def create_target(df):
     df = df.drop(columns=["readmitted"])
     return df
 
-# ---- 6. Gop cac code Unknown/Not Available ----
+# ---- Group Unknown / Not Available codes ----
 UNKNOWN_CODES = {
     "discharge_disposition_id": [18, 25, 26],
     "admission_source_id": [9, 15, 17, 20, 21],
@@ -140,7 +172,7 @@ def group_unknown_ids(df):
     return df
 
 
-# ---- 7. ICD-9 grouping cho diag_1 / diag_2 / diag_3 (rule-based, theo chapter ICD-9-CM) ----
+# ---- 7. ICD-9 grouping cho diag_1 / diag_2 / diag_3 (rule-based, by chapter ICD-9-CM) ----
 def _map_single_icd9(code):
     if pd.isna(code):
         return "Missing"
@@ -149,7 +181,7 @@ def _map_single_icd9(code):
     if not code:
         return "Missing"
 
-    # V-code / E-code: tach rieng thay vi gop chung vao "Other"
+    # V-code / E-code: keep them separate instead of grouping them into "Other"
     if code.startswith("V"):
         return "Supplementary_V"
     if code.startswith("E"):
@@ -158,9 +190,9 @@ def _map_single_icd9(code):
     try:
         code_num = float(code)
     except ValueError:
-        return "Other"  # code loi dinh dang, khong parse duoc
+        return "Other"  # Invalid code format that cannot be parsed
 
-    # --- Cac nhom "dac thu" giu nguyen nhu ban dang lam (Strack et al.) ---
+    # ---  Special groups retained from the current approach (Strack et al.) ---
     if 250 <= code_num < 251:
         return "Diabetes"
     if 390 <= code_num <= 459 or code_num == 785:
@@ -178,10 +210,10 @@ def _map_single_icd9(code):
     if 140 <= code_num <= 239:
         return "Neoplasms"
 
-    # --- Tach nho phan con lai theo chapter ICD-9-CM, thay vi don het vao "Other" ---
-    if 1 <= code_num <= 139:
+    # --- Further divide the remaining codes by ICD-9-CM chapter instead of
+    # grouping everything into "Other" ---
         return "Infectious"
-    if 240 <= code_num <= 279:          # 250 da tach o tren
+    if 240 <= code_num <= 279:
         return "Endocrine_other"
     if 280 <= code_num <= 289:
         return "Blood"
@@ -197,10 +229,10 @@ def _map_single_icd9(code):
         return "Congenital"
     if 760 <= code_num <= 779:
         return "Perinatal"
-    if 780 <= code_num <= 799:          # 785-788 da tach o tren
+    if 780 <= code_num <= 799:          
         return "Symptoms_signs"
 
-    return "Other"  # fallback that su hiem gap
+    return "Other"
 
 
 def add_diag_groups(df):
@@ -211,27 +243,27 @@ def add_diag_groups(df):
     return df
 
 
-# ---- 8. Split theo patient_nbr (tranh leakage giua cac lan nam vien cua cung 1 nguoi) ----
+# ---- Split by patient_nbr (prevent leakage between admissions of the same patient) ----
 def split_train_test(df, test_size=0.2, random_state=42, stratify_col="target"):
     splitter = GroupShuffleSplit(test_size=test_size, n_splits=1, random_state=random_state)
     train_idx, test_idx = next(splitter.split(df, groups=df["patient_nbr"]))
     train_df = df.iloc[train_idx].reset_index(drop=True)
     test_df = df.iloc[test_idx].reset_index(drop=True)
-    print(f"[split_train_test] Train: {train_df.shape[0]} dong / Test: {test_df.shape[0]} dong")
+    print(f"[split_train_test] Train: {train_df.shape[0]} rows / Test: {test_df.shape[0]} rows")
     if stratify_col in df.columns:
-        print(f"[split_train_test] Ty le target - train: {train_df[stratify_col].mean():.4f}, "
+        print(f"[split_train_test] Target rate - train: {train_df[stratify_col].mean():.4f}, "
               f"test: {test_df[stratify_col].mean():.4f}  "
-              f"(GroupShuffleSplit khong ho tro stratify that su khi group theo "
-              f"patient_nbr, nen chi kiem tra lai ty le sau khi chia; neu lech "
-              f"nhieu, can can nhac StratifiedGroupKFold cua sklearn >=1.0)")
+              f"(GroupShuffleSplit does not support true stratification when grouping by "
+              f"patient_nbr, so the target rate is checked after splitting; if the difference "
+              f"is substantial, consider StratifiedGroupKFold in sklearn >=1.0)")
     return train_df, test_df
 
 
-# ---- 9. Pipeline day du: SPLIT SOM, fit cac buoc "hoc tu du lieu" CHI tren train ----
+# ---- 9. Full pipeline: split first, fit data-dependent steps ONLY on train ----
 def run_full_pipeline(input_dir="data/input", test_size=0.2, random_state=42):
     df, ids_mapping = load_raw_data(input_dir)
 
-    # (a) Cac buoc rule-based, an toan chay truoc split
+    # (a) Rule-based steps that are safe to apply before the split
     df = basic_clean(df)
     df = create_target(df)
     df = group_unknown_ids(df)
@@ -239,10 +271,10 @@ def run_full_pipeline(input_dir="data/input", test_size=0.2, random_state=42):
 
     df = df.drop(columns=["diag_1", "diag_2", "diag_3"])
 
-    # (b) Split TRUOC khi fit bat ky thong ke nao tu du lieu
+    # (b) Split BEFORE fitting any statistics from the data
     train_df, test_df = split_train_test(df, test_size=test_size, random_state=random_state)
 
-    # (c) Fit CHI tren train, roi transform ca train va test
+    # (c) Fit ONLY on train, then transform both train and test
     dropped_cols = fit_near_constant_cols(train_df)
     train_df = drop_cols(train_df, dropped_cols)
     test_df = drop_cols(test_df, dropped_cols)
@@ -254,10 +286,15 @@ def run_full_pipeline(input_dir="data/input", test_size=0.2, random_state=42):
     train_df = apply_categories(train_df, categories)
     test_df = apply_categories(test_df, categories)
 
+    outlier_caps = fit_outlier_caps(train_df)
+    train_df = apply_outlier_caps(train_df, outlier_caps)
+    test_df = apply_outlier_caps(test_df, outlier_caps)
+
     for col in categories:
         n_unseen = (test_df[col] == "Other_unseen").sum()
         if n_unseen > 0:
-            print(f"[run_full_pipeline] Canh bao: cot '{col}' co gia tri o test "
-                  f"khong xuat hien trong train ({n_unseen} dong duoc gan nhan 'Other_unseen').")
+            print(f"[run_full_pipeline] Warning: column '{col}' contains values in the test set "
+                  f"that were not observed in the train set "
+                  f"({n_unseen} rows assigned the 'Other_unseen' label).")
 
     return train_df, test_df, ids_mapping

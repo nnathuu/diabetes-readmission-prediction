@@ -212,6 +212,7 @@ def _map_single_icd9(code):
 
     # --- Further divide the remaining codes by ICD-9-CM chapter instead of
     # grouping everything into "Other" ---
+    if 1 <= code_num <= 139:
         return "Infectious"
     if 240 <= code_num <= 279:
         return "Endocrine_other"

@@ -68,9 +68,8 @@ def fit_outlier_caps(train_df, cols=OUTLIER_COLS, factor=1.5):
         if col in train_df.columns:
             q1, q3 = train_df[col].quantile([0.25, 0.75])
             iqr = q3 - q1
-            lower = max(train_df[col].min(), q1 - factor * iqr)
-            upper = q3 + factor * iqr
-            caps[col] = (lower, upper)
+            upper = np.floor(q3 + factor * iqr)
+            caps[col] = (train_df[col].min(), upper)
     print(f"[fit_outlier_caps] Capping thresholds (fitted on train): {caps}")
     return caps
 
@@ -189,48 +188,64 @@ def _map_single_icd9(code):
 
     try:
         code_num = float(code)
+        c = int(code_num)
     except ValueError:
         return "Other"  # Invalid code format that cannot be parsed
 
     # ---  Special groups retained from the current approach (Strack et al.) ---
-    if 250 <= code_num < 251:
+
+    if 250 <= c < 251:
         return "Diabetes"
-    if 390 <= code_num <= 459 or code_num == 785:
+
+    if 390 <= c <= 459 or c == 785:
         return "Circulatory"
-    if 460 <= code_num <= 519 or code_num == 786:
+
+    if 460 <= c <= 519 or c == 786:
         return "Respiratory"
-    if 520 <= code_num <= 579 or code_num == 787:
+
+    if 520 <= c <= 579 or c == 787:
         return "Digestive"
-    if 800 <= code_num <= 999:
+
+    if 800 <= c <= 999:
         return "Injury"
-    if 710 <= code_num <= 739:
+
+    if 710 <= c <= 739:
         return "Musculoskeletal"
-    if 580 <= code_num <= 629 or code_num == 788:
+
+    if 580 <= c <= 629 or c == 788:
         return "Genitourinary"
-    if 140 <= code_num <= 239:
+
+    if 140 <= c <= 239:
         return "Neoplasms"
 
-    # --- Further divide the remaining codes by ICD-9-CM chapter instead of
-    # grouping everything into "Other" ---
-    if 1 <= code_num <= 139:
+    if 1 <= c <= 139:
         return "Infectious"
-    if 240 <= code_num <= 279:
+
+    if 240 <= c <= 279:
         return "Endocrine_other"
-    if 280 <= code_num <= 289:
+
+    if 280 <= c <= 289:
         return "Blood"
-    if 290 <= code_num <= 319:
+
+    if 290 <= c <= 319:
         return "Mental"
-    if 320 <= code_num <= 389:
+
+    if 320 <= c <= 389:
         return "Nervous_SenseOrgans"
-    if 630 <= code_num <= 677:
+
+    if 630 <= c <= 677:
         return "Pregnancy_Childbirth"
-    if 680 <= code_num <= 709:
+
+    if 680 <= c <= 709:
         return "Skin"
-    if 740 <= code_num <= 759:
+
+    if 740 <= c <= 759:
         return "Congenital"
-    if 760 <= code_num <= 779:
+
+    if 760 <= c <= 779:
         return "Perinatal"
-    if 780 <= code_num <= 799:          
+
+    if 780 <= c <= 799:
         return "Symptoms_signs"
 
     return "Other"
@@ -264,38 +279,65 @@ def split_train_test(df, test_size=0.2, random_state=42, stratify_col="target"):
 def run_full_pipeline(input_dir="data/input", test_size=0.2, random_state=42):
     df, ids_mapping = load_raw_data(input_dir)
 
-    # (a) Rule-based steps that are safe to apply before the split
+    # a. Rule-based preprocessing
     df = basic_clean(df)
     df = create_target(df)
     df = group_unknown_ids(df)
     df = add_diag_groups(df)
 
+    # b. Remove raw ICD-9 after creating grouped features
     df = df.drop(columns=["diag_1", "diag_2", "diag_3"])
 
-    # (b) Split BEFORE fitting any statistics from the data
-    train_df, test_df = split_train_test(df, test_size=test_size, random_state=random_state)
+    # c. Split by patient to prevent leakage
+    train_df, test_df = split_train_test(
+        df,
+        test_size=test_size,
+        random_state=random_state
+    )
 
-    # (c) Fit ONLY on train, then transform both train and test
+    # d. Fit preprocessing rules ONLY on train
     dropped_cols = fit_near_constant_cols(train_df)
+
     train_df = drop_cols(train_df, dropped_cols)
     test_df = drop_cols(test_df, dropped_cols)
 
+    # e. Handle missing values
     train_df = handle_missing_values(train_df)
     test_df = handle_missing_values(test_df)
 
+    # f. Fit categories ONLY on train
     categories = fit_categories(train_df)
+
     train_df = apply_categories(train_df, categories)
     test_df = apply_categories(test_df, categories)
 
+    # g. Fit outlier caps ONLY on train
     outlier_caps = fit_outlier_caps(train_df)
+
     train_df = apply_outlier_caps(train_df, outlier_caps)
     test_df = apply_outlier_caps(test_df, outlier_caps)
 
+    # h. Check unseen categories in test
     for col in categories:
         n_unseen = (test_df[col] == "Other_unseen").sum()
         if n_unseen > 0:
-            print(f"[run_full_pipeline] Warning: column '{col}' contains values in the test set "
-                  f"that were not observed in the train set "
-                  f"({n_unseen} rows assigned the 'Other_unseen' label).")
+            print(
+                f"[run_full_pipeline] Warning: column '{col}' "
+                f"contains {n_unseen} unseen values in test."
+            )
 
-    return train_df, test_df, ids_mapping
+    # i. Save patient groups before removing patient_nbr
+    train_patient_groups = train_df["patient_nbr"].copy()
+    test_patient_groups = test_df["patient_nbr"].copy()
+
+    # j. Remove identifiers before modeling
+    train_df = train_df.drop(columns=["patient_nbr", "encounter_id"])
+    test_df = test_df.drop(columns=["patient_nbr", "encounter_id"])
+
+    return (
+        train_df,
+        test_df,
+        train_patient_groups,
+        test_patient_groups,
+        ids_mapping,
+    )
